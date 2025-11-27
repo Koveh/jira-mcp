@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  jira-mcp:
+    build: .
+    container_name: jira-mcp
+    ports:
+      - "4200:4200"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4200/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+

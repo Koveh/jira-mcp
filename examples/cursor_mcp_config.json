@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "jira": {
+      "command": "python",
+      "args": ["/path/to/jira-mcp/mcp_server.py"],
+      "env": {
+        "JIRA_BASE_URL": "https://your-domain.atlassian.net",
+        "JIRA_EMAIL": "your-email@example.com",
+        "JIRA_API_TOKEN": "your-api-token"
+      }
+    }
+  }
+}
+
