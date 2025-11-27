@@ -66,27 +66,38 @@ python http_server.py
 
 ## Usage
 
-### Add to Cursor IDE
+### Add to Cursor IDE (Local MCP)
 
-Add to `~/.cursor/mcp.json`:
+1. Clone this repo:
+```bash
+git clone https://github.com/Koveh/jira-mcp.git
+cd jira-mcp
+pip install -r requirements.txt
+```
+
+2. Get your Jira API token from: https://id.atlassian.com/manage-profile/security/api-tokens
+
+3. Add to `~/.cursor/mcp.json`:
 
 ```json
 {
   "mcpServers": {
     "jira": {
       "command": "python",
-      "args": ["/path/to/jira-mcp/mcp_server.py"],
+      "args": ["/full/path/to/jira-mcp/mcp_server.py"],
       "env": {
         "JIRA_BASE_URL": "https://your-domain.atlassian.net",
         "JIRA_EMAIL": "your-email@example.com",
-        "JIRA_API_TOKEN": "your-api-token"
+        "JIRA_API_TOKEN": "your-api-token-from-step-2"
       }
     }
   }
 }
 ```
 
-Restart Cursor and you'll have these tools available:
+4. Restart Cursor (Cmd/Ctrl+Shift+P → "Developer: Reload Window")
+
+You'll have these tools available:
 
 | Tool | Description |
 |------|-------------|

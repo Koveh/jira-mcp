@@ -404,16 +404,40 @@ class JiraHTTPHandler(BaseHTTPRequestHandler):
         </div>
         
         <div class="card">
-            <h2>MCP Configuration</h2>
-            <p style="color: #8b949e; margin-bottom: 12px;">Add to your Cursor MCP config:</p>
-            <pre id="output" style="color: #e0e0e0;">{
+            <h2>How to Use</h2>
+            
+            <h3 style="color: #58a6ff; font-size: 13px; margin: 16px 0 8px;">Option 1: Web Dashboard (This Page)</h3>
+            <p style="color: #8b949e; font-size: 13px; margin-bottom: 16px;">Connect above and manage your Jira tasks directly from this dashboard.</p>
+            
+            <h3 style="color: #58a6ff; font-size: 13px; margin: 16px 0 8px;">Option 2: REST API</h3>
+            <pre style="background: #0d1117; padding: 12px; border-radius: 6px; font-size: 12px; color: #7ee787; overflow-x: auto;"># Get auth token
+curl -X POST https://jira-mcp.koveh.com/api/connect \\
+  -H "Content-Type: application/json" \\
+  -d '{"base_url":"https://YOUR.atlassian.net","email":"YOU@email.com","api_token":"YOUR_TOKEN"}'
+
+# Use token for API calls  
+curl https://jira-mcp.koveh.com/api/projects -H "Authorization: Bearer YOUR_TOKEN"</pre>
+            
+            <h3 style="color: #58a6ff; font-size: 13px; margin: 16px 0 8px;">Option 3: Local MCP in Cursor (Recommended)</h3>
+            <p style="color: #8b949e; font-size: 13px; margin-bottom: 8px;">Clone repo and add to <code>~/.cursor/mcp.json</code>:</p>
+            <pre style="background: #0d1117; padding: 12px; border-radius: 6px; font-size: 12px; color: #e0e0e0; overflow-x: auto;"># Clone first:
+git clone https://github.com/Koveh/jira-mcp.git
+cd jira-mcp && pip install -r requirements.txt</pre>
+            <pre style="background: #0d1117; padding: 12px; border-radius: 6px; font-size: 12px; color: #e0e0e0; overflow-x: auto; margin-top: 8px;">// ~/.cursor/mcp.json
+{
   "mcpServers": {
     "jira": {
-      "command": "npx",
-      "args": ["-y", "@anthropic/mcp-remote", "https://jira-mcp.koveh.com/mcp"]
+      "command": "python",
+      "args": ["/path/to/jira-mcp/mcp_server.py"],
+      "env": {
+        "JIRA_BASE_URL": "https://YOUR.atlassian.net",
+        "JIRA_EMAIL": "your-email@example.com",
+        "JIRA_API_TOKEN": "your-api-token-from-atlassian"
+      }
     }
   }
 }</pre>
+            <p style="color: #6e7681; font-size: 12px; margin-top: 8px;">Get API token: <a href="https://id.atlassian.com/manage-profile/security/api-tokens" target="_blank" style="color: #58a6ff;">id.atlassian.com/manage-profile/security/api-tokens</a></p>
         </div>
     </div>
 
