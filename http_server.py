@@ -1,19 +1,81 @@
 #!/usr/bin/env python3
 """
-Jira MCP HTTP Server - Public REST API for Jira operations.
+Jira MCP HTTP Server - REST API + MCP SSE for remote connections.
 Users provide their own Jira credentials.
 
 Usage:
     python http_server.py
     
 Available at: https://jira-mcp.koveh.com
+
+MCP Remote Config:
+    {
+      "mcpServers": {
+        "jira": {
+          "command": "npx",
+          "args": ["-y", "@anthropic/mcp-remote", "https://jira-mcp.koveh.com/mcp/YOUR_TOKEN"]
+        }
+      }
+    }
 """
 import json
+import uuid
+import queue
+import threading
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 import base64
 
 from jira_client import JiraClient, JiraConfig
+
+
+# Store active MCP sessions
+MCP_SESSIONS = {}
+MCP_SESSION_LOCK = threading.Lock()
+
+
+def create_mcp_session(base_url: str, email: str, api_token: str) -> str:
+    """Create a new MCP session."""
+    config = JiraConfig(base_url=base_url, email=email, api_token=api_token)
+    client = JiraClient(config)
+    client.get_current_user()  # Test connection
+    
+    session_id = str(uuid.uuid4())[:8]
+    with MCP_SESSION_LOCK:
+        MCP_SESSIONS[session_id] = {
+            "client": client,
+            "config": config,
+            "queue": queue.Queue(),
+            "created": time.time()
+        }
+    return session_id
+
+
+def get_mcp_session(session_id: str) -> dict:
+    """Get MCP session by ID."""
+    with MCP_SESSION_LOCK:
+        return MCP_SESSIONS.get(session_id)
+
+
+def decode_token(token: str) -> dict:
+    """Decode base64 credentials token."""
+    try:
+        return json.loads(base64.b64decode(token).decode())
+    except:
+        return None
+
+
+def extract_description(desc: dict) -> str:
+    """Extract text from ADF."""
+    if not desc or not isinstance(desc, dict):
+        return ""
+    texts = []
+    for content in desc.get("content", []):
+        for item in content.get("content", []):
+            if item.get("type") == "text":
+                texts.append(item.get("text", ""))
+    return " ".join(texts)
 
 
 class JiraHTTPHandler(BaseHTTPRequestHandler):
@@ -109,6 +171,11 @@ class JiraHTTPHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": "jql parameter required"}, 400)
                 else:
                     self._search_issues(client, jql)
+        elif path.startswith("/mcp/"):
+            self._handle_mcp_sse()
+        elif path == "/sse":
+            # SSE endpoint for mcp-remote
+            self._handle_mcp_sse()
         else:
             self._send_json({"error": "Not found"}, 404)
     
@@ -144,13 +211,25 @@ class JiraHTTPHandler(BaseHTTPRequestHandler):
             # Generate auth token for subsequent requests
             creds = json.dumps({"base_url": body["base_url"], "email": body["email"], "api_token": body["api_token"]})
             token = base64.b64encode(creds.encode()).decode()
+            # Create MCP URL for remote connections
+            mcp_url = f"https://jira-mcp.koveh.com/mcp/{token}"
+            
             self._send_json({
                 "status": "connected",
                 "user": user.get("displayName"),
                 "email": user.get("emailAddress"),
                 "accountId": user.get("accountId"),
                 "token": token,
-                "help": "Use this token in Authorization: Bearer <token> header"
+                "mcp_url": mcp_url,
+                "cursor_config": {
+                    "mcpServers": {
+                        "jira": {
+                            "command": "npx",
+                            "args": ["-y", "@anthropic/mcp-remote", mcp_url]
+                        }
+                    }
+                },
+                "help": "Use token in Authorization header OR use mcp_url in Cursor"
             })
         elif path == "/api/issues":
             if not client:
@@ -163,6 +242,8 @@ class JiraHTTPHandler(BaseHTTPRequestHandler):
                 return
             issue_key = path.split("/")[-2]
             self._transition_issue(client, issue_key, body)
+        elif path.startswith("/mcp/") or path == "/message":
+            self._handle_mcp_message(body)
         else:
             self._send_json({"error": "Not found"}, 404)
     
@@ -286,6 +367,151 @@ class JiraHTTPHandler(BaseHTTPRequestHandler):
             "priority": fields.get("priority", {}).get("name") if fields.get("priority") else None,
         }
     
+    # ===== MCP SSE Methods =====
+    
+    def _get_mcp_client_from_path(self) -> JiraClient:
+        """Get Jira client from MCP path token."""
+        parsed = urlparse(self.path)
+        parts = parsed.path.strip('/').split('/')
+        
+        if len(parts) >= 2:
+            token = parts[-1]
+            creds = decode_token(token)
+            if creds:
+                config = JiraConfig(
+                    base_url=creds.get("base_url"),
+                    email=creds.get("email"),
+                    api_token=creds.get("api_token")
+                )
+                return JiraClient(config)
+        return None
+    
+    def _handle_mcp_sse(self):
+        """Handle MCP SSE connection."""
+        client = self._get_mcp_client_from_path()
+        if not client:
+            self._send_json({"error": "Invalid token in URL"}, 401)
+            return
+        
+        # Send SSE headers
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        
+        # Send endpoint event
+        parsed = urlparse(self.path)
+        token = parsed.path.strip('/').split('/')[-1]
+        endpoint_url = f"/mcp/{token}"
+        self.wfile.write(f"event: endpoint\ndata: \"{endpoint_url}\"\n\n".encode())
+        self.wfile.flush()
+        
+        # Keep connection alive
+        try:
+            while True:
+                time.sleep(30)
+                self.wfile.write(b": keepalive\n\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+    
+    def _handle_mcp_message(self, body: dict):
+        """Handle incoming MCP message."""
+        client = self._get_mcp_client_from_path()
+        if not client:
+            self._send_json({"error": "Invalid token"}, 401)
+            return
+        
+        response = self._process_mcp_request(client, body)
+        self._send_json(response)
+    
+    def _process_mcp_request(self, client: JiraClient, request: dict) -> dict:
+        """Process MCP request."""
+        method = request.get("method")
+        params = request.get("params", {})
+        req_id = request.get("id")
+        
+        result = None
+        error = None
+        
+        try:
+            if method == "initialize":
+                result = {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "jira-mcp", "version": "1.0.0"}
+                }
+            elif method == "tools/list":
+                result = {"tools": self._get_mcp_tools()}
+            elif method == "tools/call":
+                result = self._call_mcp_tool(client, params)
+            elif method == "notifications/initialized":
+                result = {}
+            else:
+                error = {"code": -32601, "message": f"Unknown method: {method}"}
+        except Exception as e:
+            error = {"code": -32603, "message": str(e)}
+        
+        response = {"jsonrpc": "2.0", "id": req_id}
+        if error:
+            response["error"] = error
+        else:
+            response["result"] = result
+        return response
+    
+    def _get_mcp_tools(self) -> list:
+        """Get MCP tools list."""
+        return [
+            {"name": "jira_get_projects", "description": "Get all Jira projects", "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "jira_get_issues", "description": "Get issues from project", "inputSchema": {"type": "object", "properties": {"project_key": {"type": "string"}, "max_results": {"type": "integer", "default": 50}}, "required": ["project_key"]}},
+            {"name": "jira_get_issue", "description": "Get issue details", "inputSchema": {"type": "object", "properties": {"issue_key": {"type": "string"}}, "required": ["issue_key"]}},
+            {"name": "jira_create_issue", "description": "Create new issue", "inputSchema": {"type": "object", "properties": {"project_key": {"type": "string"}, "summary": {"type": "string"}, "description": {"type": "string"}, "issue_type": {"type": "string", "default": "Task"}}, "required": ["project_key", "summary"]}},
+            {"name": "jira_update_issue", "description": "Update issue", "inputSchema": {"type": "object", "properties": {"issue_key": {"type": "string"}, "summary": {"type": "string"}, "description": {"type": "string"}}, "required": ["issue_key"]}},
+            {"name": "jira_delete_issue", "description": "Delete issue", "inputSchema": {"type": "object", "properties": {"issue_key": {"type": "string"}}, "required": ["issue_key"]}},
+            {"name": "jira_search", "description": "Search with JQL", "inputSchema": {"type": "object", "properties": {"jql": {"type": "string"}, "max_results": {"type": "integer", "default": 50}}, "required": ["jql"]}},
+            {"name": "jira_get_current_user", "description": "Get current user", "inputSchema": {"type": "object", "properties": {}}}
+        ]
+    
+    def _call_mcp_tool(self, client: JiraClient, params: dict) -> dict:
+        """Execute MCP tool."""
+        name = params.get("name")
+        args = params.get("arguments", {})
+        result = None
+        
+        if name == "jira_get_projects":
+            projects = client.get_all_projects()
+            result = [{"key": p["key"], "name": p["name"]} for p in projects]
+        elif name == "jira_get_issues":
+            issues = client.get_issues_by_project(args["project_key"], args.get("max_results", 50))
+            result = [{"key": i["key"], "summary": i.get("fields", {}).get("summary"), "status": i.get("fields", {}).get("status", {}).get("name")} for i in issues if i.get("fields")]
+        elif name == "jira_get_issue":
+            issue = client.get_issue(args["issue_key"])
+            fields = issue["fields"]
+            result = {"key": issue["key"], "summary": fields.get("summary"), "status": fields.get("status", {}).get("name"), "description": extract_description(fields.get("description"))}
+        elif name == "jira_create_issue":
+            issue = client.create_issue(args["project_key"], args["summary"], args.get("description", ""), args.get("issue_type", "Task"))
+            result = {"key": issue.get("key"), "id": issue.get("id")}
+        elif name == "jira_update_issue":
+            fields = {}
+            if args.get("summary"): fields["summary"] = args["summary"]
+            if args.get("description"): fields["description"] = {"type": "doc", "version": 1, "content": [{"type": "paragraph", "content": [{"type": "text", "text": args["description"]}]}]}
+            client.update_issue(args["issue_key"], fields)
+            result = {"status": "updated", "key": args["issue_key"]}
+        elif name == "jira_delete_issue":
+            client.delete_issue(args["issue_key"])
+            result = {"status": "deleted", "key": args["issue_key"]}
+        elif name == "jira_search":
+            issues = client.search_issues(args["jql"], args.get("max_results", 50))
+            result = [{"key": i["key"], "summary": i.get("fields", {}).get("summary")} for i in issues if i.get("fields")]
+        elif name == "jira_get_current_user":
+            result = client.get_current_user()
+        else:
+            raise ValueError(f"Unknown tool: {name}")
+        
+        return {"content": [{"type": "text", "text": json.dumps(result, indent=2)}]}
+    
     def _serve_dashboard(self):
         html = """<!DOCTYPE html>
 <html>
@@ -403,41 +629,28 @@ class JiraHTTPHandler(BaseHTTPRequestHandler):
             <pre id="output">Ready to connect...</pre>
         </div>
         
+        <div class="card hidden" id="mcp-config-card">
+            <h2>🎉 Your Cursor MCP Config</h2>
+            <p style="color: #3fb950; font-size: 13px; margin-bottom: 12px;">Copy this to <code>~/.cursor/mcp.json</code> and restart Cursor:</p>
+            <pre id="mcp-config" style="background: #0d1117; padding: 16px; border-radius: 8px; font-size: 12px; color: #e0e0e0; overflow-x: auto; border: 1px solid #238636;"></pre>
+            <button class="btn" onclick="copyMcpConfig()" style="margin-top: 12px;">📋 Copy Config</button>
+        </div>
+        
         <div class="card">
             <h2>How to Use</h2>
             
-            <h3 style="color: #58a6ff; font-size: 13px; margin: 16px 0 8px;">Option 1: Web Dashboard (This Page)</h3>
-            <p style="color: #8b949e; font-size: 13px; margin-bottom: 16px;">Connect above and manage your Jira tasks directly from this dashboard.</p>
+            <h3 style="color: #58a6ff; font-size: 13px; margin: 16px 0 8px;">Option 1: Remote MCP in Cursor ⭐ Recommended</h3>
+            <p style="color: #8b949e; font-size: 13px; margin-bottom: 8px;">Connect above to get your personal MCP config. No installation needed!</p>
             
-            <h3 style="color: #58a6ff; font-size: 13px; margin: 16px 0 8px;">Option 2: REST API</h3>
-            <pre style="background: #0d1117; padding: 12px; border-radius: 6px; font-size: 12px; color: #7ee787; overflow-x: auto;"># Get auth token
-curl -X POST https://jira-mcp.koveh.com/api/connect \\
-  -H "Content-Type: application/json" \\
-  -d '{"base_url":"https://YOUR.atlassian.net","email":"YOU@email.com","api_token":"YOUR_TOKEN"}'
-
-# Use token for API calls  
-curl https://jira-mcp.koveh.com/api/projects -H "Authorization: Bearer YOUR_TOKEN"</pre>
+            <h3 style="color: #58a6ff; font-size: 13px; margin: 16px 0 8px;">Option 2: Web Dashboard</h3>
+            <p style="color: #8b949e; font-size: 13px; margin-bottom: 16px;">Manage Jira tasks directly from this page.</p>
             
-            <h3 style="color: #58a6ff; font-size: 13px; margin: 16px 0 8px;">Option 3: Local MCP in Cursor (Recommended)</h3>
-            <p style="color: #8b949e; font-size: 13px; margin-bottom: 8px;">Clone repo and add to <code>~/.cursor/mcp.json</code>:</p>
-            <pre style="background: #0d1117; padding: 12px; border-radius: 6px; font-size: 12px; color: #e0e0e0; overflow-x: auto;"># Clone first:
-git clone https://github.com/Koveh/jira-mcp.git
-cd jira-mcp && pip install -r requirements.txt</pre>
-            <pre style="background: #0d1117; padding: 12px; border-radius: 6px; font-size: 12px; color: #e0e0e0; overflow-x: auto; margin-top: 8px;">// ~/.cursor/mcp.json
-{
-  "mcpServers": {
-    "jira": {
-      "command": "python",
-      "args": ["/path/to/jira-mcp/mcp_server.py"],
-      "env": {
-        "JIRA_BASE_URL": "https://YOUR.atlassian.net",
-        "JIRA_EMAIL": "your-email@example.com",
-        "JIRA_API_TOKEN": "your-api-token-from-atlassian"
-      }
-    }
-  }
-}</pre>
-            <p style="color: #6e7681; font-size: 12px; margin-top: 8px;">Get API token: <a href="https://id.atlassian.com/manage-profile/security/api-tokens" target="_blank" style="color: #58a6ff;">id.atlassian.com/manage-profile/security/api-tokens</a></p>
+            <h3 style="color: #58a6ff; font-size: 13px; margin: 16px 0 8px;">Option 3: Local MCP</h3>
+            <pre style="background: #0d1117; padding: 12px; border-radius: 6px; font-size: 12px; color: #e0e0e0; overflow-x: auto;">git clone https://github.com/Koveh/jira-mcp.git
+pip install -r requirements.txt
+# Then add to ~/.cursor/mcp.json with local path</pre>
+            
+            <p style="color: #6e7681; font-size: 12px; margin-top: 16px;">Get API token: <a href="https://id.atlassian.com/manage-profile/security/api-tokens" target="_blank" style="color: #58a6ff;">id.atlassian.com/manage-profile/security/api-tokens</a></p>
         </div>
     </div>
 
@@ -477,6 +690,9 @@ cd jira-mcp && pip install -r requirements.txt</pre>
                 
                 authToken = data.token;
                 localStorage.setItem('jira_token', authToken);
+                if (data.cursor_config) {
+                    localStorage.setItem('cursor_config', JSON.stringify(data.cursor_config));
+                }
                 
                 document.getElementById('user-name').textContent = data.user;
                 document.getElementById('user-email').textContent = data.email;
@@ -486,6 +702,12 @@ cd jira-mcp && pip install -r requirements.txt</pre>
                 document.getElementById('user-card').classList.remove('hidden');
                 document.getElementById('projects-card').classList.remove('hidden');
                 document.getElementById('issues-card').classList.remove('hidden');
+                
+                // Show MCP config
+                if (data.cursor_config) {
+                    document.getElementById('mcp-config').textContent = JSON.stringify(data.cursor_config, null, 2);
+                    document.getElementById('mcp-config-card').classList.remove('hidden');
+                }
                 
                 log(data);
                 loadProjects();
@@ -497,11 +719,20 @@ cd jira-mcp && pip install -r requirements.txt</pre>
         function disconnect() {
             authToken = null;
             localStorage.removeItem('jira_token');
+            localStorage.removeItem('cursor_config');
             document.getElementById('auth-card').classList.remove('hidden');
             document.getElementById('user-card').classList.add('hidden');
             document.getElementById('projects-card').classList.add('hidden');
             document.getElementById('issues-card').classList.add('hidden');
+            document.getElementById('mcp-config-card').classList.add('hidden');
             log({status: 'disconnected'});
+        }
+        
+        function copyMcpConfig() {
+            const config = document.getElementById('mcp-config').textContent;
+            navigator.clipboard.writeText(config).then(() => {
+                alert('Copied! Paste to ~/.cursor/mcp.json and restart Cursor');
+            });
         }
         
         async function loadProjects() {
@@ -566,6 +797,14 @@ cd jira-mcp && pip install -r requirements.txt</pre>
                     document.getElementById('user-card').classList.remove('hidden');
                     document.getElementById('projects-card').classList.remove('hidden');
                     document.getElementById('issues-card').classList.remove('hidden');
+                    
+                    // Show saved MCP config
+                    const savedConfig = localStorage.getItem('cursor_config');
+                    if (savedConfig) {
+                        document.getElementById('mcp-config').textContent = savedConfig;
+                        document.getElementById('mcp-config-card').classList.remove('hidden');
+                    }
+                    
                     loadProjects();
                 } else {
                     disconnect();
