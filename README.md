@@ -68,22 +68,28 @@ python http_server.py
 
 ### Add to Cursor IDE (Local MCP)
 
-1. Clone this repo:
+1. Clone and set up virtual environment:
 ```bash
 git clone https://github.com/Koveh/jira-mcp.git
 cd jira-mcp
+
+# Create virtual environment (required for mcp package)
+python3 -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
+
+# Install dependencies
 pip install -r requirements.txt
 ```
 
 2. Get your Jira API token from: https://id.atlassian.com/manage-profile/security/api-tokens
 
-3. Add to `~/.cursor/mcp.json`:
+3. Add to `~/.cursor/mcp.json` (macOS/Linux) or `%USERPROFILE%\.cursor\mcp.json` (Windows):
 
 ```json
 {
   "mcpServers": {
     "jira": {
-      "command": "python",
+      "command": "/full/path/to/jira-mcp/venv/bin/python",
       "args": ["/full/path/to/jira-mcp/mcp_server.py"],
       "env": {
         "JIRA_BASE_URL": "https://your-domain.atlassian.net",
@@ -94,6 +100,8 @@ pip install -r requirements.txt
   }
 }
 ```
+
+> **Important:** Use the full path to the Python interpreter inside the venv (`venv/bin/python` on Linux/macOS, `venv\Scripts\python.exe` on Windows). This ensures the `mcp` package is available.
 
 4. Restart Cursor (Cmd/Ctrl+Shift+P → "Developer: Reload Window")
 

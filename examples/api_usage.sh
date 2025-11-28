@@ -53,3 +53,5 @@ echo -e "\n\n=== Search Issues ==="
 curl -s "$BASE_URL/api/search?jql=status%20%3D%20%27In%20Progress%27" \
   -H "Authorization: Bearer $TOKEN"
 
+
+

@@ -386,36 +386,53 @@ class JiraHTTPHandler(BaseHTTPRequestHandler):
                 return JiraClient(config)
         return None
     
+    def _get_token_from_path(self) -> str:
+        """Extract token from URL path."""
+        parsed = urlparse(self.path)
+        parts = parsed.path.strip('/').split('/')
+        if len(parts) >= 2:
+            return parts[-1]
+        return None
+    
     def _handle_mcp_sse(self):
-        """Handle MCP SSE connection."""
-        client = self._get_mcp_client_from_path()
-        if not client:
-            self._send_json({"error": "Invalid token in URL"}, 401)
+        """Handle MCP SSE connection for mcp-remote."""
+        token = self._get_token_from_path()
+        if not token:
+            self._send_json({"error": "Token required in URL"}, 401)
             return
         
-        # Send SSE headers
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
+        # Validate token format (don't validate Jira creds yet)
+        creds = decode_token(token)
+        if not creds:
+            self._send_json({"error": "Invalid token format"}, 401)
+            return
         
-        # Send endpoint event
-        parsed = urlparse(self.path)
-        token = parsed.path.strip('/').split('/')[-1]
-        endpoint_url = f"/mcp/{token}"
-        self.wfile.write(f"event: endpoint\ndata: \"{endpoint_url}\"\n\n".encode())
-        self.wfile.flush()
+        # Build complete HTTP response manually and send via raw socket
+        endpoint_url = f"https://jira-mcp.koveh.com/mcp/{token}"
+        sse_data = f"event: endpoint\ndata: {endpoint_url}\n\n"
         
-        # Keep connection alive
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/event-stream\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Connection: keep-alive\r\n"
+            "X-Accel-Buffering: no\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "\r\n"
+            f"{sse_data}"
+        )
+        
+        # Send directly to socket (bypass buffered wfile)
         try:
+            self.connection.sendall(response.encode('utf-8'))
+            print(f"[MCP-SSE] Sent endpoint: {endpoint_url[:50]}...", flush=True)
+            
+            # Keep connection alive
             while True:
-                time.sleep(30)
-                self.wfile.write(b": keepalive\n\n")
-                self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+                time.sleep(15)
+                self.connection.sendall(b":ping\n\n")
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            print(f"[MCP-SSE] Connection closed: {type(e).__name__}", flush=True)
     
     def _handle_mcp_message(self, body: dict):
         """Handle incoming MCP message."""

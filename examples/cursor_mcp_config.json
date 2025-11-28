@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "jira": {
-      "command": "python",
+      "command": "/path/to/jira-mcp/venv/bin/python",
       "args": ["/path/to/jira-mcp/mcp_server.py"],
       "env": {
         "JIRA_BASE_URL": "https://your-domain.atlassian.net",
@@ -11,4 +11,6 @@
     }
   }
 }
+
+
 
